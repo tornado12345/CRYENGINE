@@ -9,8 +9,9 @@
 	#include <CrySystem/IConsole.h>
 	#include <CryThreading/IThreadManager.h>
 	#include <CryExtension/CryGUID.h>
-	#include <CryExtension/CryGUIDHelper.h>
 	#include <CrySystem/CryVersion.h>
+	#include <CrySerialization/IArchiveHost.h>
+	#include <CryString/CryPath.h>
 
 	#include <winsock2.h>
 	#include <curl/curl.h>
@@ -106,8 +107,11 @@ inline void AddComma(string& message)
 CUserAnalytics::CUserAnalytics()
 	: m_curl(nullptr)
 	, m_curlHeaderList(nullptr)
+	, m_pUserAnalyticsSendThread(nullptr)
 {
-	gEnv->pSystem->GetISystemEventDispatcher()->RegisterListener(this);
+	gEnv->pSystem->GetISystemEventDispatcher()->RegisterListener(this, "CUserAnalytics");
+
+	TriggerEvent("UserAnalyticsSessionStart"); // note: this will not show up in log
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -123,6 +127,7 @@ void CUserAnalytics::OnSystemEvent(ESystemEvent event, UINT_PTR wparam, UINT_PTR
 	case ESYSTEM_EVENT_CRYSYSTEM_INIT_DONE:
 		{
 			ReadWriteAnonymousToken();
+			ReadUserIdFromDisk();
 
 			m_userAnalyticsServerAddress = REGISTER_STRING("sys_UserAnalyticsServerAddress", UA_FULL_SERVER_URL, VF_NULL, "User Analytics Server address");
 
@@ -174,9 +179,12 @@ void CUserAnalytics::Shutdown()
 
 	TriggerEvent("UserAnalyticsSessionEnd"); // note: this will not show up in log
 
-	m_pUserAnalyticsSendThread->SignalStopWork();
-	gEnv->pThreadManager->JoinThread(m_pUserAnalyticsSendThread, eJM_Join);
-	delete m_pUserAnalyticsSendThread;
+	if (m_pUserAnalyticsSendThread)
+	{
+		m_pUserAnalyticsSendThread->SignalStopWork();
+		gEnv->pThreadManager->JoinThread(m_pUserAnalyticsSendThread, eJM_Join);
+		delete m_pUserAnalyticsSendThread;
+	}
 
 	ShutdownCURL();
 
@@ -207,7 +215,7 @@ string CUserAnalytics::GetTimestamp()
 string& CUserAnalytics::GetSessionId()
 {
 	static CryGUID sessionId = CryGUID::Create();
-	static string sessionIdName = CryGUIDHelper::PrintGuid(sessionId);
+	static string sessionIdName = sessionId.ToString();
 
 	return sessionIdName;
 }
@@ -274,10 +282,20 @@ void CUserAnalytics::TriggerEvent(const char* szEventName, UserAnalytics::Attrib
 	UserAnalytics::AddPairToMessage(message, "localTimestamp", GetTimestamp().c_str());
 	UserAnalytics::AddComma(message);
 
-	UserAnalytics::AddPairToMessage(message, "AnonymousUserToken", m_anonymousUserToken.c_str());
-	UserAnalytics::AddComma(message);
-
 	UserAnalytics::BeginAttributesScope(message);
+
+	if (!m_anonymousUserToken.empty())
+	{
+		UserAnalytics::AddPairToMessage(message, "AnonymousUserToken", m_anonymousUserToken.c_str());
+		UserAnalytics::AddComma(message);
+	}
+
+	if (!m_userId.empty())
+	{ 
+		UserAnalytics::AddPairToMessage(message, "userId", m_userId.c_str());
+		UserAnalytics::AddComma(message);
+	}
+
 	UserAnalytics::AddPairToMessage(message, "sessionId", GetSessionId().c_str());
 
 	if (attributes != nullptr)
@@ -308,7 +326,7 @@ void CUserAnalytics::TriggerEvent(const char* szEventName, UserAnalytics::Attrib
 void CUserAnalytics::ReadWriteAnonymousToken()
 {
 	PWSTR pLocalDirectoryPath = nullptr;
-	HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE | KF_FLAG_DONT_UNEXPAND, NULL, &pLocalDirectoryPath);
+	HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE | KF_FLAG_DONT_UNEXPAND, nullptr, &pLocalDirectoryPath);
 	bool success = true;
 	if (SUCCEEDED(hr))
 	{
@@ -332,7 +350,7 @@ void CUserAnalytics::ReadWriteAnonymousToken()
 			{
 				// Store a random GUID in the file
 				CryGUID guid = CryGUID::Create();
-				m_anonymousUserToken = CryGUIDHelper::PrintGuid(guid);
+				m_anonymousUserToken = guid.ToString();
 
 				fwrite(m_anonymousUserToken.c_str(), sizeof(char), m_anonymousUserToken.size(), pFile);
 				fclose(pFile);
@@ -372,6 +390,42 @@ void CUserAnalytics::ReadWriteAnonymousToken()
 	if (!success && cv_logging->GetIVal() > 0)
 	{
 		CryLogAlways("[User Analytics] Could not read or write anonymous user token");
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////
+void CUserAnalytics::ReadUserIdFromDisk()
+{
+	PWSTR pLocalDirectoryPath = nullptr;
+	HRESULT hr = SHGetKnownFolderPath(FOLDERID_Profile, KF_FLAG_CREATE | KF_FLAG_DONT_UNEXPAND, nullptr, &pLocalDirectoryPath);
+	bool success = true;
+	if (SUCCEEDED(hr))
+	{
+		// Convert from UNICODE to UTF-8
+		char szLocalDirectoryPath[MAX_PATH];
+		cry_strcpy(szLocalDirectoryPath, MAX_PATH, CryStringUtils::WStrToUTF8(pLocalDirectoryPath));
+
+		string sFilePath = PathUtil::Make(szLocalDirectoryPath, ".cryengine/common.json");
+
+		// read json content
+		struct SLauncherInfo
+		{
+			uint64 userId;
+
+			void Serialize(Serialization::IArchive& ar)
+			{
+				ar(userId, "userId", "UserId");
+			}
+		};
+
+		SLauncherInfo launcherInfo;
+		
+		if (Serialization::LoadJsonFile(launcherInfo, sFilePath.c_str()))
+		{
+			m_userId = string().Format("%" PRIu64, launcherInfo.userId);
+		}		
+
+		CoTaskMemFree(pLocalDirectoryPath);
 	}
 }
 
@@ -448,6 +502,7 @@ void CUserAnalytics::PrepareAndSendEvents()
 
 			if (cv_collect)
 			{
+				CryWarning(VALIDATOR_MODULE_SYSTEM, VALIDATOR_WARNING, "[User Analytics] Setting CVar sys_UserAnalyticsCollect back to zero.");
 				cv_collect->Set(0);
 			}
 		}
